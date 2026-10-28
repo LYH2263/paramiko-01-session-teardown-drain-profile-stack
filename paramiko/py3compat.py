@@ -159,7 +159,10 @@ else:
     BytesIO = io.BytesIO        # NOQA
 
     def is_callable(c):
-        return isinstance(c, collections.Callable)
+        try:
+            return isinstance(c, collections.abc.Callable)
+        except AttributeError:
+            return isinstance(c, collections.Callable)
 
     def get_next(c):
         return c.__next__

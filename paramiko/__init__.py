@@ -54,6 +54,16 @@ from paramiko.pkey import PKey
 from paramiko.hostkeys import HostKeys
 from paramiko.config import SSHConfig
 from paramiko.proxy import ProxyCommand
+from paramiko.teardown import (
+    TeardownProfile,
+    SessionTeardownStack,
+    TeardownPolicyError,
+    HalfCloseMode,
+    ChannelCloseLinger,
+    TransportTeardown,
+    SftpHandleFlush,
+    BASELINE_PROFILE,
+)
 
 from paramiko.common import AUTH_SUCCESSFUL, AUTH_PARTIALLY_SUCCESSFUL, AUTH_FAILED, \
     OPEN_SUCCEEDED, OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED, OPEN_FAILED_CONNECT_FAILED, \
@@ -99,5 +109,13 @@ __all__ = [ 'Transport',
             'AgentKey',
             'HostKeys',
             'SSHConfig',
+            'TeardownProfile',
+            'SessionTeardownStack',
+            'TeardownPolicyError',
+            'HalfCloseMode',
+            'ChannelCloseLinger',
+            'TransportTeardown',
+            'SftpHandleFlush',
+            'BASELINE_PROFILE',
             'util',
             'io_sleep' ]

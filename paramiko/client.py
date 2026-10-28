@@ -40,6 +40,8 @@ from paramiko.ssh_exception import (
     SSHException, BadHostKeyException, NoValidConnectionsError
 )
 from paramiko.transport import Transport
+from paramiko import teardown
+from paramiko.teardown import TransportTeardown
 from paramiko.util import retry_on_signal, ClosingContextManager
 
 
@@ -74,6 +76,24 @@ class SSHClient (ClosingContextManager):
         self._policy = RejectPolicy()
         self._transport = None
         self._agent = None
+        # session teardown profile stack.  Before connect() this stack is
+        # owned by the client; connect() adopts it onto the new Transport so
+        # frames pushed early stay in force for the whole session.
+        self._teardown_stack = teardown.stack_for_session(self)
+
+    def teardown_profiles(self):
+        """
+        Return the :class:`~paramiko.teardown.SessionTeardownStack` governing
+        this client session.
+
+        Before :meth:`connect` this is the client's own stack; once connected
+        it is the same per-session stack the underlying `.Transport`, its
+        channels and SFTP handles consult, so frames pushed from any of those
+        sides share one ordered stack.
+        """
+        if self._transport is not None:
+            return self._transport.teardown_profiles()
+        return self._teardown_stack
 
     def load_system_host_keys(self, filename=None):
         """
@@ -324,6 +344,8 @@ class SSHClient (ClosingContextManager):
                 raise NoValidConnectionsError(errors)
 
         t = self._transport = Transport(sock, gss_kex=gss_kex, gss_deleg_creds=gss_deleg_creds)
+        # share the client's (possibly already framed) teardown profile stack
+        t.adopt_teardown_stack(self._teardown_stack)
         t.use_compression(compress=compress)
         if gss_kex and gss_host is None:
             t.set_gss_host(hostname)
@@ -383,6 +405,18 @@ class SSHClient (ClosingContextManager):
         """
         Close this SSHClient and its underlying `.Transport`.
 
+        The active session teardown frame's ``transport_teardown`` axis
+        governs the shape of this exit:
+
+        * ``channels_only`` performs only channel-level closes on the
+          transport; the transport thread, socket, the client's binding to it
+          and the SSH agent are all left intact;
+        * ``stop_unlink_sock`` performs the full transport teardown but
+          deliberately leaves the client-owned SSH agent alone (a bare
+          ``Transport.close`` cannot handle the agent);
+        * ``client_with_agent`` (and the unframed legacy behavior) performs
+          the full transport teardown *and* closes the agent.
+
         .. warning::
             Failure to do this may, in some situations, cause your Python
             interpreter to hang at shutdown (often due to race conditions).
@@ -391,9 +425,25 @@ class SSHClient (ClosingContextManager):
         """
         if self._transport is None:
             return
+        stack = self.teardown_profiles()
+        # explicit() (not effective()): a frame tightening some other axis
+        # must not silently drop the legacy agent-closing step
+        mode = stack.explicit('transport_teardown')
+        if mode == TransportTeardown.CHANNELS_ONLY:
+            # restricted teardown: delegate the channel closes to the
+            # transport exit but keep the session, the binding and the agent.
+            self._transport.close()
+            return
+        # full transport teardown (stop thread / unlink / close socket)
         self._transport.close()
         self._transport = None
-
+        if mode == TransportTeardown.STOP_UNLINK_SOCK:
+            # pure transport disposition: the agent is a client-owned
+            # resource and must not be closed by this frame
+            return
+        # legacy (no frame) or the explicit client_with_agent profile:
+        # closing the agent is its own mandatory step, not an accident of
+        # calling Transport.close()
         if self._agent is not None:
             self._agent.close()
             self._agent = None

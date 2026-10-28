@@ -34,6 +34,7 @@ from paramiko.py3compat import long
 from paramiko.sftp import CMD_CLOSE, CMD_READ, CMD_DATA, SFTPError, CMD_WRITE, \
     CMD_STATUS, CMD_FSTAT, CMD_ATTRS, CMD_FSETSTAT, CMD_EXTENDED
 from paramiko.sftp_attr import SFTPAttributes
+from paramiko.teardown import TeardownPolicyError, SftpHandleFlush
 
 
 class SFTPFile (BufferedFile):
@@ -61,17 +62,26 @@ class SFTPFile (BufferedFile):
         self._prefetch_lock = threading.Lock()
         self._saved_exception = None
         self._reqs = deque()
+        # register with the sftp session / transport session teardown stack
+        # (weak on both sides: this must not extend the handle's lifetime)
+        self.sftp._track_open_file(self)
 
     def __del__(self):
-        self._close(async=True)
+        try:
+            self._close(async_=True)
+        except TeardownPolicyError:
+            # the active profile forbids silent fire-and-forget handle
+            # teardown; the session-level reject_open_handles gate is what
+            # surfaces this loudly at an explicit teardown point instead.
+            pass
 
     def close(self):
         """
         Close the file.
         """
-        self._close(async=False)
+        self._close(async_=False)
 
-    def _close(self, async=False):
+    def _close(self, async_=False):
         # We allow double-close without signaling an error, because real
         # Python file objects do.  However, we must protect against actually
         # sending multiple CMD_CLOSE packets, because after we close our
@@ -81,12 +91,58 @@ class SFTPFile (BufferedFile):
         # __del__.)
         if self._closed:
             return
+
+        stack = self._teardown_stack()
+        if stack is not None and stack.has_frames():
+            flush_mode = stack.effective().sftp_handle_flush
+        else:
+            # unframed: legacy drain-then-synchronous-close behavior
+            flush_mode = SftpHandleFlush.SYNC_FINISH
+
+        if flush_mode == SftpHandleFlush.REJECT_OPEN_HANDLES:
+            if async_:
+                # implicit GC teardown must not silently fire an async
+                # CMD_CLOSE in this frame
+                raise TeardownPolicyError(
+                    'implicit async close of SFTP handle %s is forbidden by '
+                    'the active teardown profile (reject_open_handles); '
+                    'close handles explicitly before session teardown'
+                    % hexlify(self.handle))
+            if self.sftp._has_other_open_file(self):
+                # an explicit teardown while sibling handles are still open is
+                # rejected *before* anything is drained or marked closed
+                raise TeardownPolicyError(
+                    'refusing to close SFTP handle %s while other SFTP '
+                    'handles on the session are still open '
+                    '(reject_open_handles)' % hexlify(self.handle))
+            # last open handle: take the ordered synchronous close path
+            flush_mode = SftpHandleFlush.SYNC_FINISH
+
         self.sftp._log(DEBUG, 'close(%s)' % hexlify(self.handle))
+
+        if flush_mode == SftpHandleFlush.ASYNC_NOWAIT:
+            # fire-and-forget frame: never drain pipelined responses and never
+            # block waiting for the CMD_CLOSE response
+            BufferedFile.close(self)
+            self.sftp._untrack_open_file(self)
+            try:
+                self.sftp._async_request(type(None), CMD_CLOSE, self.handle)
+            except EOFError:
+                # may have outlived the Transport connection
+                pass
+            except (IOError, socket.error):
+                # may have outlived the Transport connection
+                pass
+            return
+
+        # SYNC_FINISH: drain pipelined responses, then close synchronously
+        # (an async caller -- typically __del__ -- still avoids the wait)
         if self.pipelined:
             self.sftp._finish_responses(self)
         BufferedFile.close(self)
+        self.sftp._untrack_open_file(self)
         try:
-            if async:
+            if async_:
                 # GC'd file handle could be called from an arbitrary thread -- don't wait for a response
                 self.sftp._async_request(type(None), CMD_CLOSE, self.handle)
             else:
@@ -97,6 +153,13 @@ class SFTPFile (BufferedFile):
         except (IOError, socket.error):
             # may have outlived the Transport connection
             pass
+
+    def _teardown_stack(self):
+        sftp = self.sftp
+        get_stack = getattr(sftp, '_teardown_stack', None)
+        if get_stack is None:
+            return None
+        return get_stack()
 
     def _data_in_prefetch_requests(self, offset, size):
         k = [x for x in list(self._prefetch_extents.values()) if x[0] <= offset]

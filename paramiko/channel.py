@@ -38,6 +38,12 @@ from paramiko.ssh_exception import SSHException
 from paramiko.file import BufferedFile
 from paramiko.buffered_pipe import BufferedPipe, PipeTimeout
 from paramiko import pipe
+from paramiko import teardown
+from paramiko.teardown import (
+    TeardownPolicyError,
+    HalfCloseMode,
+    ChannelCloseLinger,
+)
 from paramiko.util import ClosingContextManager
 
 
@@ -616,6 +622,12 @@ class Channel (ClosingContextManager):
         will fail.  The remote end will receive no more data (after queued data
         is flushed).  Channels are automatically closed when their `.Transport`
         is closed or when they are garbage collected.
+
+        Under a session teardown frame with
+        ``channel_close_linger=unlink_immediate`` the channel is additionally
+        detached from the `.Transport` right after the close sequence is
+        produced; the default ``linger_for_status`` disposition keeps it
+        linked so late ``exit-status`` meta-data can still arrive.
         """
         self.lock.acquire()
         try:
@@ -629,7 +641,17 @@ class Channel (ClosingContextManager):
 
             if not self.active or self.closed:
                 return
+            stack = self._teardown_stack()
+            if stack is not None and stack.has_frames():
+                linger = stack.effective().channel_close_linger
+            else:
+                linger = ChannelCloseLinger.LINGER_FOR_STATUS
             msgs = self._close_internal()
+            if linger == ChannelCloseLinger.UNLINK_IMMEDIATE:
+                # this frame deliberately gives up post-close meta-data:
+                # detach before the lock is released so no exit-status that
+                # races the close can still be dispatched
+                self.transport._unlink_channel(self.chanid)
         finally:
             self.lock.release()
         for m in msgs:
@@ -899,10 +921,56 @@ class Channel (ClosingContextManager):
         are disallowed.  If ``how`` is 2, further sends and receives are
         disallowed.  This closes the stream in one or both directions.
 
+        A pushed session teardown frame may tighten the read/write half-close
+        semantics via its ``half_close_mode`` axis: ``feign_read_local``
+        confines half closes to the local read feign and refuses any
+        write-direction half close (which would emit ``CHANNEL_EOF``), and
+        ``forbid_half`` refuses every half close so callers must use the full
+        `close` profile.  With no frame pushed, the legacy behavior is
+        unchanged: read halves feign EOF locally and write halves send
+        ``CHANNEL_EOF``.
+
         :param int how:
             0 (stop receiving), 1 (stop sending), or 2 (stop receiving and
               sending).
+
+        :raises .TeardownPolicyError:
+            when the active frame forbids the requested half close.
         """
+        stack = self._teardown_stack()
+        if stack is None or not stack.has_frames():
+            self._shutdown_legacy(how)
+            return
+        mode = stack.effective().half_close_mode
+        if mode == HalfCloseMode.FORBID_HALF:
+            raise TeardownPolicyError(
+                'half-close is forbidden by the active teardown profile '
+                '(half_close_mode=%r); use Channel.close()'
+                % HalfCloseMode.FORBID_HALF)
+        want_read = (how == 0) or (how == 2)
+        want_write = (how == 1) or (how == 2)
+        if want_write and mode == HalfCloseMode.FEIGN_READ_LOCAL:
+            # the frame only grants a local read feign; do not mutate state
+            # before refusing, so no half-action leaks past the policy error
+            raise TeardownPolicyError(
+                'write-direction half close would send CHANNEL_EOF but the '
+                'active teardown profile only allows local read feign '
+                '(half_close_mode=%r); use Channel.close()'
+                % HalfCloseMode.FEIGN_READ_LOCAL)
+        if want_read:
+            # feign "read" shutdown: deliberately no packet is produced
+            self.eof_received = 1
+        if want_write:
+            self.lock.acquire()
+            try:
+                m = self._send_eof()
+            finally:
+                self.lock.release()
+            if m is not None:
+                self.transport._send_user_message(m)
+
+    def _shutdown_legacy(self, how):
+        # unframed behavior, kept identical to the historical implementation
         if (how == 0) or (how == 2):
             # feign "read" shutdown
             self.eof_received = 1
@@ -950,6 +1018,14 @@ class Channel (ClosingContextManager):
     def _set_transport(self, transport):
         self.transport = transport
         self.logger = util.get_logger(self.transport.get_log_channel())
+
+    def _teardown_stack(self):
+        # the session teardown profile stack owning this channel, or None if
+        # the channel is not attached to a session yet.
+        transport = self.transport
+        if transport is None:
+            return None
+        return transport.teardown_profiles()
 
     def _set_window(self, window_size, max_packet_size):
         self.in_window_size = window_size

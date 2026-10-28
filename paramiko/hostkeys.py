@@ -26,10 +26,13 @@ from hmac import HMAC
 from paramiko.py3compat import b, u, encodebytes, decodebytes
 
 try:
-    from collections import MutableMapping
+    from collections.abc import MutableMapping
 except ImportError:
-    # noinspection PyUnresolvedReferences
-    from UserDict import DictMixin as MutableMapping
+    try:
+        from collections import MutableMapping
+    except ImportError:
+        # noinspection PyUnresolvedReferences
+        from UserDict import DictMixin as MutableMapping
 
 from paramiko.dsskey import DSSKey
 from paramiko.rsakey import RSAKey

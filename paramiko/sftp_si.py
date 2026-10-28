@@ -48,7 +48,9 @@ class SFTPServerInterface (object):
         :param .ServerInterface server:
             the server object associated with this channel and SFTP subsystem
         """
-        super(SFTPServerInterface, self).__init__(*largs, **kwargs)
+        # Python 3's object.__init__ rejects extra positional/keyword args
+        # (Py2 silently ignored them); they only exist for subclass overrides
+        super(SFTPServerInterface, self).__init__()
 
     def session_started(self):
         """

@@ -90,6 +90,10 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         self._cwd = None
         # request # -> SFTPFile
         self._expecting = weakref.WeakValueDictionary()
+        # currently open SFTPFile handles on this sftp session (weak so the
+        # registry never keeps a handle alive); consulted by the
+        # reject_open_handles teardown profile
+        self._open_sftp_files = weakref.WeakSet()
         if type(sock) is Channel:
             # override default logger
             transport = self.sock.get_transport()
@@ -791,6 +795,38 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         while fileobj in self._expecting.values():
             self._read_response()
             fileobj._check_exception()
+
+    ###  open handle registry (teardown profiles)  ###
+
+    def _track_open_file(self, sftp_file):
+        self._open_sftp_files.add(sftp_file)
+        stack = self._teardown_stack()
+        if stack is not None:
+            stack.register_open_handle(sftp_file)
+
+    def _untrack_open_file(self, sftp_file):
+        self._open_sftp_files.discard(sftp_file)
+        stack = self._teardown_stack()
+        if stack is not None:
+            stack.unregister_open_handle(sftp_file)
+
+    def _has_other_open_file(self, sftp_file):
+        for other in list(self._open_sftp_files):
+            if other is sftp_file:
+                continue
+            if not getattr(other, '_closed', False):
+                return True
+        return False
+
+    def _teardown_stack(self):
+        sock = self.sock
+        get_transport = getattr(sock, 'get_transport', None)
+        if get_transport is None:
+            return None
+        transport = get_transport()
+        if transport is None:
+            return None
+        return transport.teardown_profiles()
 
     def _convert_status(self, msg):
         """

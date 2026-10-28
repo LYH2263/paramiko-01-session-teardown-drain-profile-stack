@@ -63,6 +63,8 @@ from paramiko.server import ServerInterface
 from paramiko.sftp_client import SFTPClient
 from paramiko.ssh_exception import (SSHException, BadAuthenticationType,
                                     ChannelException, ProxyCommandFailure)
+from paramiko import teardown
+from paramiko.teardown import TransportTeardown, SftpHandleFlush
 from paramiko.util import retry_on_signal, ClosingContextManager, clamp_value
 
 from Crypto.Cipher import Blowfish, AES, DES3, ARC4
@@ -361,6 +363,9 @@ class Transport (threading.Thread, ClosingContextManager):
 
         # tracking open channels
         self._channels = ChannelMap()
+        # session-scoped teardown/drain profile stack (one per Transport;
+        # never shared with another session)
+        self._teardown_stack = teardown.stack_for_session(self)
         self.channel_events = {}       # (id -> Event)
         self.channels_seen = {}        # (id -> True)
         self._channel_counter = 0
@@ -641,12 +646,66 @@ class Transport (threading.Thread, ClosingContextManager):
         Transport._modulus_pack = None
         return False
 
+    def teardown_profiles(self):
+        """
+        Return the :class:`~paramiko.teardown.SessionTeardownStack` bound to
+        this session.
+
+        The stack is a per-session object (channels and SFTP handles opened on
+        this transport reach the same stack); frames pushed on a different
+        transport are never visible here.
+        """
+        stack = getattr(self, '_teardown_stack', None)
+        if stack is None:
+            stack = teardown.stack_for_session(self)
+            self._teardown_stack = stack
+        return stack
+
+    def adopt_teardown_stack(self, stack):
+        """
+        Bind an existing teardown profile stack (typically owned by an
+        `.SSHClient` before its transport exists) onto this transport.
+
+        Frames already pushed onto the stack remain in force for the whole
+        session.
+        """
+        self._teardown_stack = teardown.bind_session_stack(self, stack)
+        return stack
+
     def close(self):
         """
         Close this session, and any open channels that are tied to it.
+
+        With no session teardown frame pushed (and for the
+        ``stop_unlink_sock`` / ``client_with_agent`` transport dispositions),
+        this is the legacy sequence: stop the transport thread, unlink every
+        registered channel, close the socket.
+
+        Under a frame with ``transport_teardown=channels_only`` only
+        channel-level closes are performed: the thread is not stopped and the
+        socket stays open, so the session remains usable.
+
+        Under a frame with ``sftp_handle_flush=reject_open_handles`` the
+        teardown fails loudly if SFTP handles are still open, before any
+        channel or socket is torn down.
         """
         if not self.active:
             return
+        stack = self.teardown_profiles()
+        if stack.has_frames():
+            profile = stack.effective()
+            if profile.sftp_handle_flush == SftpHandleFlush.REJECT_OPEN_HANDLES:
+                # gate before anything destructive happens
+                stack.enforce_no_open_sftp_handles()
+            if profile.transport_teardown == TransportTeardown.CHANNELS_ONLY:
+                # channel-level teardown only: each close goes through the
+                # Channel.close exit (so channel_close_linger still applies),
+                # but the transport thread keeps running and the socket and
+                # session stay alive
+                for chan in list(self._channels.values()):
+                    chan.close()
+                return
+        # full transport teardown (legacy)
         self.stop_thread()
         for chan in list(self._channels.values()):
             chan._unlink()
@@ -1667,7 +1726,7 @@ class Transport (threading.Thread, ClosingContextManager):
         elif name.endswith("-ctr"):
             # CTR modes, we need a counter
             counter = Counter.new(nbits=self._cipher_info[name]['block-size'] * 8, initial_value=util.inflate_long(iv, True))
-            return self._cipher_info[name]['class'].new(key, self._cipher_info[name]['mode'], iv, counter)
+            return self._cipher_info[name]['class'].new(key, self._cipher_info[name]['mode'], counter=counter)
         else:
             return self._cipher_info[name]['class'].new(key, self._cipher_info[name]['mode'], iv)
 

@@ -106,7 +106,17 @@ class DSSKey (PKey):
             k = util.inflate_long(os.urandom(qsize), 1)
             if (k > 2) and (k < self.q):
                 break
-        r, s = dss.sign(util.inflate_long(digest, 1), k)
+        try:
+            r, s = dss.sign(util.inflate_long(digest, 1), k)
+        except NotImplementedError:
+            # modern pycryptodome removed the legacy DSA sign() API; it
+            # returns the signature as fixed-width (r || s) -- P1363 binary
+            from Crypto.Signature import DSS as _DSS
+            from Crypto.Hash import SHA as _SHA
+            packed = _DSS.new(dss, 'fips-186-3').sign(_SHA.new(data))
+            half = len(packed) // 2
+            r = util.inflate_long(packed[:half], 1)
+            s = util.inflate_long(packed[half:], 1)
         m = Message()
         m.add_string('ssh-dss')
         # apparently, in rare cases, r or s may be shorter than 20 bytes!
@@ -135,7 +145,21 @@ class DSSKey (PKey):
         sigM = util.inflate_long(sha1(data).digest(), 1)
 
         dss = DSA.construct((long(self.y), long(self.g), long(self.p), long(self.q)))
-        return dss.verify(sigM, (sigR, sigS))
+        try:
+            return dss.verify(sigM, (sigR, sigS))
+        except NotImplementedError:
+            # modern pycryptodome removed the legacy DSA verify() API; it
+            # expects the signature as fixed-width (r || s) -- P1363 binary
+            from Crypto.Signature import DSS as _DSS
+            from Crypto.Hash import SHA as _SHA
+            width = (dss.q.bit_length() + 7) // 8
+            packed = (util.deflate_long(sigR, 0).rjust(width, zero_byte) +
+                      util.deflate_long(sigS, 0).rjust(width, zero_byte))
+            try:
+                _DSS.new(dss, 'fips-186-3').verify(_SHA.new(data), packed)
+                return True
+            except ValueError:
+                return False
 
     def _encode_key(self):
         if self.x is None:
@@ -166,7 +190,11 @@ class DSSKey (PKey):
             by ``pyCrypto.PublicKey``).
         :return: new `.DSSKey` private key
         """
-        dsa = DSA.generate(bits, os.urandom, progress_func)
+        try:
+            dsa = DSA.generate(bits, os.urandom, progress_func)
+        except TypeError:
+            # modern pycryptodome dropped the progress_func argument
+            dsa = DSA.generate(bits, os.urandom)
         key = DSSKey(vals=(dsa.p, dsa.q, dsa.g, dsa.y))
         key.x = dsa.x
         return key

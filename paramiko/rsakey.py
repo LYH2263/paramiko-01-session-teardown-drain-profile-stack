@@ -93,9 +93,17 @@ class RSAKey (PKey):
         return self.d is not None
 
     def sign_ssh_data(self, data):
-        digest = sha1(data).digest()
         rsa = RSA.construct((long(self.n), long(self.e), long(self.d)))
-        sig = util.deflate_long(rsa.sign(self._pkcs1imify(digest), bytes())[0], 0)
+        digest = sha1(data).digest()
+        try:
+            sig = util.deflate_long(
+                rsa.sign(self._pkcs1imify(digest), bytes())[0], 0)
+        except NotImplementedError:
+            # modern pycryptodome removed the legacy sign() API; PKCS#1 v1.5
+            # over SHA-1 is exactly what the old call produced
+            from Crypto.Signature import pkcs1_15
+            from Crypto.Hash import SHA as _SHA
+            sig = pkcs1_15.new(rsa).sign(_SHA.new(data))
         m = Message()
         m.add_string('ssh-rsa')
         m.add_string(sig)
@@ -105,12 +113,26 @@ class RSAKey (PKey):
         if msg.get_text() != 'ssh-rsa':
             return False
         sig = util.inflate_long(msg.get_binary(), True)
-        # verify the signature by SHA'ing the data and encrypting it using the
-        # public key.  some wackiness ensues where we "pkcs1imify" the 20-byte
-        # hash into a string as long as the RSA key.
-        hash_obj = util.inflate_long(self._pkcs1imify(sha1(data).digest()), True)
         rsa = RSA.construct((long(self.n), long(self.e)))
-        return rsa.verify(hash_obj, (sig,))
+        try:
+            # verify the signature by SHA'ing the data and encrypting it using
+            # the public key.  some wackiness ensues where we "pkcs1imify" the
+            # 20-byte hash into a string as long as the RSA key.
+            hash_obj = util.inflate_long(
+                self._pkcs1imify(sha1(data).digest()), True)
+            return rsa.verify(hash_obj, (sig,))
+        except NotImplementedError:
+            # modern pycryptodome PKCS#1 v1.5 verification API; the legacy
+            # inflate_long() above handed the signature back as an integer
+            from Crypto.Signature import pkcs1_15
+            from Crypto.Hash import SHA as _SHA
+            from Crypto.Util.number import long_to_bytes
+            sig_bytes = long_to_bytes(sig, rsa.size_in_bytes())
+            try:
+                pkcs1_15.new(rsa).verify(_SHA.new(data), sig_bytes)
+                return True
+            except ValueError:
+                return False
 
     def _encode_key(self):
         if (self.p is None) or (self.q is None):
@@ -143,7 +165,11 @@ class RSAKey (PKey):
             by ``pyCrypto.PublicKey``).
         :return: new `.RSAKey` private key
         """
-        rsa = RSA.generate(bits, os.urandom, progress_func)
+        try:
+            rsa = RSA.generate(bits, os.urandom, progress_func)
+        except TypeError:
+            # modern pycryptodome dropped the progress_func argument
+            rsa = RSA.generate(bits, os.urandom)
         key = RSAKey(vals=(rsa.e, rsa.n))
         key.d = rsa.d
         key.p = rsa.p
